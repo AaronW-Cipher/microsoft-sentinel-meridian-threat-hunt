@@ -730,7 +730,9 @@ MeridianAudit_CL
 
 ---
 
-# MITRE ATT&CK Mapping
+# MITRE ATT&CK / Hunt Mapping
+
+> Note: Most mappings below represent attacker behavior observed during the hunt. A small number reflect defensive or incident-response activity mapped by the cyber range for investigation context.
 
 | Technique ID | Technique | Investigation Evidence |
 |---|---|---|
@@ -743,8 +745,8 @@ MeridianAudit_CL
 | T1071 | Application Layer Protocol | Repeated outbound C2 attempts |
 | T1213 | Data from Information Repositories | Patient data collection/export |
 | T1565.001 | Stored Data Manipulation | `backup.conf` tampering |
-| T1562.001 | Impair Defenses | `sysmon.service` removed by automated remediation |
-| T1005 | Data from Local System | AVML volatile-memory acquisition |
+| T1562.001 | Impair Defenses | Automated remediation unintentionally removed `sysmon.service`, creating a telemetry gap |
+| T1005 | Data from Local System | Responder used AVML to acquire volatile memory during incident response |
 
 ---
 
