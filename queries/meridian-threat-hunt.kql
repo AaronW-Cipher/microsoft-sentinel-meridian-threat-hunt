@@ -2,3 +2,154 @@
 // Platform: Microsoft Sentinel / Azure Log Analytics
 // Language: KQL
 // Purpose: Key threat-hunting queries used during the investigation
+
+
+// =====================================================
+// 1. Reconnaissance Tool Identification
+// =====================================================
+
+MeridianAccess_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where ClientIp_s == "10.1.134.57"
+| summarize
+    FirstSeen=min(EventTime_t),
+    RequestCount=count()
+    by UserAgent_s
+| sort by FirstSeen asc;
+
+
+// =====================================================
+// 2. Suspicious Web Activity / Path Traversal
+// =====================================================
+
+MeridianAccess_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where ClientIp_s == "10.1.134.57"
+| where RequestUri_s contains "config_viewer.php"
+| where RequestUri_s contains "file="
+| project EventTime_t, RequestUri_s, StatusCode_s, ResponseSize_s, UserAgent_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 3. Successful SSH Authentication
+// =====================================================
+
+MeridianAuth_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where ProcessName_s == "sshd"
+| where RawMessage_s contains "Accepted"
+| where SourceIP == "10.1.134.57"
+| project EventTime_t, TargetUser_s, SourceIP, SourcePort_s, RawMessage_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 4. Failed Privilege Escalation Attempts
+// =====================================================
+
+MeridianDefender_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where RawMessage_s has_any ("sudo", "root")
+| project EventTime_t, EventCategory_s, SourceIP, RawMessage_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 5. SUID Root Shell Execution
+// =====================================================
+
+MeridianAudit_CL
+| where EventTime_t between (datetime(2026-02-06 04:35:00) .. datetime(2026-02-06 04:45:00))
+| where isnotempty(EventTime_t)
+| where comm_s == "rootbash"
+   or exe_s contains "rootbash"
+   or Argv_s contains "rootbash"
+| project EventTime_t, comm_s, exe_s, auid_s, euid_s, Argv_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 6. Persistent health_check Backdoor
+// =====================================================
+
+MeridianSnapshot_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where ProcBeaconName_s == "health_check"
+   or ProcBeaconExeLink_s contains "health_check"
+| project
+    EventTime_t,
+    ProcBeaconName_s,
+    ProcBeaconExeLink_s,
+    ProcBeaconPid_s,
+    ProcBeaconPPid_s,
+    ProcBeaconUid_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 7. C2 / Network Blocking Activity
+// =====================================================
+
+MeridianDefender_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where EventCategory_s == "NETWORK"
+| project EventTime_t, SourceIP, DestIp_s, DestPort_s, RawMessage_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 8. Database / Patient Data Activity
+// =====================================================
+
+MeridianDefender_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where EventCategory_s == "DB"
+   or RawMessage_s has_any ("patient", "export", "database")
+| project EventTime_t, EventCategory_s, RawMessage_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 9. Automated Defense Sweep Activity
+// =====================================================
+
+MeridianDefender_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where EventCategory_s == "SWEEP"
+| project EventTime_t, RawMessage_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 10. Sysmon Removal / Detection Gap
+// =====================================================
+
+MeridianDefender_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where RawMessage_s contains "Removed service"
+| project EventTime_t, EventCategory_s, RawMessage_s
+| sort by EventTime_t asc;
+
+
+// =====================================================
+// 11. AVML Memory Acquisition
+// =====================================================
+
+MeridianAudit_CL
+| where EventTime_t between (datetime(2026-02-06 05:00:00) .. datetime(2026-02-06 05:30:00))
+| where isnotempty(EventTime_t)
+| where comm_s contains "avml"
+    or exe_s contains "avml"
+    or Argv_s contains "avml"
+| project EventTime_t, comm_s, exe_s, auid_s, euid_s, Argv_s
+| sort by EventTime_t asc;
