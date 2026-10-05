@@ -1,12 +1,46 @@
+// ============================================================================
 // Microsoft Sentinel Threat Hunt - Meridian Health
+// ============================================================================
 // Platform: Microsoft Sentinel / Azure Log Analytics
-// Language: KQL
-// Purpose: Key threat-hunting queries used during the investigation
+// Query Language: Kusto Query Language (KQL)
+// Environment: Simulated Cyber Range
+// Investigation Window: 2026-02-06
+// Attacker IP: 10.1.134.57
+//
+// Purpose:
+// Portfolio query pack documenting the key investigative pivots used to
+// reconstruct a multi-stage Linux web application intrusion.
+//
+// Investigation Areas:
+// - Reconnaissance
+// - Initial Access / Path Traversal / LFI
+// - Credential Access
+// - SSH / Valid Accounts
+// - Privilege Escalation
+// - Persistence
+// - Command and Control
+// - Collection / Data Exfiltration
+// - Defense Evasion / Detection Gaps
+// - Incident Response / Memory Acquisition
+//
+// IMPORTANT:
+// EventTime_t represents the actual event timestamp in this dataset.
+// TimeGenerated reflects ingestion time and should not be used for the
+// investigation timeline.
+// ============================================================================
 
 
-// =====================================================
-// 1. Reconnaissance Tool Identification
-// =====================================================
+// ============================================================================
+// 1. RECONNAISSANCE - Identify Attacker Tooling
+// ============================================================================
+// Purpose:
+// Group web activity from the confirmed attacker IP by user-agent and determine
+// when each reconnaissance tool first appeared.
+//
+// Finding:
+// Four distinct tools were identified in sequence:
+// Nmap -> curl -> WhatWeb -> Gobuster
+// ============================================================================
 
 MeridianAccess_CL
 | where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
@@ -19,9 +53,39 @@ MeridianAccess_CL
 | sort by FirstSeen asc;
 
 
-// =====================================================
-// 2. Suspicious Web Activity / Path Traversal
-// =====================================================
+// ============================================================================
+// 2. INITIAL ACCESS - Identify Deliberate Pre-Scan Endpoint Access
+// ============================================================================
+// Purpose:
+// Examine requests made before Gobuster enumeration began at 03:55:05.
+//
+// Finding:
+// config_viewer.php was deliberately accessed with curl before mass directory
+// enumeration began.
+// ============================================================================
+
+MeridianAccess_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where ClientIp_s == "10.1.134.57"
+| where EventTime_t < datetime(2026-02-06 03:55:05)
+| summarize
+    FirstSeen=min(EventTime_t),
+    Requests=count()
+    by RequestUri_s, UserAgent_s, StatusCode_s
+| sort by FirstSeen asc;
+
+
+// ============================================================================
+// 3. INITIAL ACCESS - Path Traversal / Local File Inclusion (LFI)
+// ============================================================================
+// Purpose:
+// Identify requests to the vulnerable config_viewer.php endpoint containing
+// the file parameter.
+//
+// Findings:
+// /etc/passwd and database.conf were successfully requested.
+// ============================================================================
 
 MeridianAccess_CL
 | where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
@@ -29,13 +93,25 @@ MeridianAccess_CL
 | where ClientIp_s == "10.1.134.57"
 | where RequestUri_s contains "config_viewer.php"
 | where RequestUri_s contains "file="
-| project EventTime_t, RequestUri_s, StatusCode_s, ResponseSize_s, UserAgent_s
+| project
+    EventTime_t,
+    RequestUri_s,
+    StatusCode_s,
+    ResponseSize_s,
+    UserAgent_s
 | sort by EventTime_t asc;
 
 
-// =====================================================
-// 3. Successful SSH Authentication
-// =====================================================
+// ============================================================================
+// 4. CREDENTIAL ACCESS - Successful SSH Authentication
+// ============================================================================
+// Purpose:
+// Identify successful SSH authentication originating from the attacker IP.
+//
+// Finding:
+// svc_backup successfully authenticated from 10.1.134.57 shortly after
+// database.conf was retrieved.
+// ============================================================================
 
 MeridianAuth_CL
 | where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
@@ -43,45 +119,205 @@ MeridianAuth_CL
 | where ProcessName_s == "sshd"
 | where RawMessage_s contains "Accepted"
 | where SourceIP == "10.1.134.57"
-| project EventTime_t, TargetUser_s, SourceIP, SourcePort_s, RawMessage_s
+| project
+    EventTime_t,
+    TargetUser_s,
+    SourceIP,
+    SourcePort_s,
+    RawMessage_s
 | sort by EventTime_t asc;
 
 
-// =====================================================
-// 4. Failed Privilege Escalation Attempts
-// =====================================================
+// ============================================================================
+// 5. PRIVILEGE ESCALATION - Review Authentication and sudo Activity
+// ============================================================================
+// Purpose:
+// Review the compromised account's authentication activity and privilege
+// escalation attempts after SSH access.
+//
+// Finding:
+// svc_backup attempted sudo but was not permitted to execute the requested
+// command as root.
+// ============================================================================
+
+MeridianAuth_CL
+| where EventTime_t between (
+    datetime(2026-02-06 04:09:00) ..
+    datetime(2026-02-06 04:40:15)
+)
+| where isnotempty(EventTime_t)
+| where ProcessName_s in ("sudo", "su")
+    or RawMessage_s has "sudo"
+    or RawMessage_s has "root"
+    or RawMessage_s has "authentication"
+| project
+    EventTime_t,
+    ProcessName_s,
+    TargetUser_s,
+    SourceIP,
+    RawMessage_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 6. PRIVILEGE ESCALATION - Failed Direct Root SSH Attempts
+// ============================================================================
+// Purpose:
+// Identify failed attempts to authenticate directly as root.
+//
+// Finding:
+// Multiple root SSH authentication attempts failed.
+// ============================================================================
+
+MeridianAuth_CL
+| where EventTime_t between (
+    datetime(2026-02-06 04:44:00) ..
+    datetime(2026-02-06 04:47:30)
+)
+| where isnotempty(EventTime_t)
+| where TargetUser_s == "root"
+    or RawMessage_s has "root"
+| project
+    EventTime_t,
+    ProcessName_s,
+    TargetUser_s,
+    SourceIP,
+    RawMessage_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 7. PRIVILEGE ESCALATION - SUID Root Shell Execution
+// ============================================================================
+// Purpose:
+// Locate execution of the pre-staged rootbash binary and inspect original
+// versus effective UID context.
+//
+// Finding:
+// /tmp/rootbash -p executed from the compromised user context with euid 0,
+// confirming successful root-level execution.
+// ============================================================================
+
+MeridianAudit_CL
+| where EventTime_t between (
+    datetime(2026-02-06 04:35:00) ..
+    datetime(2026-02-06 04:45:00)
+)
+| where isnotempty(EventTime_t)
+| where comm_s == "rootbash"
+    or exe_s contains "rootbash"
+    or Argv_s contains "rootbash"
+| project
+    EventTime_t,
+    comm_s,
+    exe_s,
+    auid_s,
+    euid_s,
+    Argv_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 8. PERSISTENCE - Identify the health_check Backdoor
+// ============================================================================
+// Purpose:
+// Inspect suspicious process snapshots and identify the executable path,
+// process IDs, and UID context.
+//
+// Finding:
+// /opt/meridian/scripts/health_check
+//
+// The process was associated with real UID 1001 while retaining effective
+// root privileges.
+// ============================================================================
+
+MeridianSnapshot_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where isnotempty(ProcBeaconExeLink_s)
+| project
+    EventTime_t,
+    ProcBeaconName_s,
+    ProcBeaconExeLink_s,
+    ProcBeaconUid_s,
+    ProcBeaconPid_s,
+    ProcBeaconPPid_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 9. PERSISTENCE / RESPONSE GAP - Review Automated Sweep Activity
+// ============================================================================
+// Purpose:
+// Review everything the automated response sweep detected and remediated.
+//
+// Findings included:
+// - Crontabs reverted
+// - SSH keys reverted
+// - /tmp/rootbash killed and removed
+// - Temporary directories cleaned
+// - backup.conf reverted
+// - health_check detected as non-baseline but NOT removed
+// ============================================================================
+
+MeridianDefender_CL
+| where EventTime_t between (
+    datetime(2026-02-06 04:40:00) ..
+    datetime(2026-02-06 05:10:00)
+)
+| where isnotempty(EventTime_t)
+| project
+    EventTime_t,
+    EventCategory_s,
+    SourceIP,
+    DestIp_s,
+    DestPort_s,
+    RawMessage_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 10. COMMAND AND CONTROL - Identify Repeated Network Blocks
+// ============================================================================
+// Purpose:
+// Review network-defense telemetry for repeated outbound communication attempts.
+//
+// Finding:
+// The backdoor repeatedly attempted communication with:
+// 10.1.134.57:43212
+//
+// The firewall blocked the communication but did not terminate the process.
+// ============================================================================
 
 MeridianDefender_CL
 | where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
 | where isnotempty(EventTime_t)
-| where RawMessage_s has_any ("sudo", "root")
-| project EventTime_t, EventCategory_s, SourceIP, RawMessage_s
+| where EventCategory_s == "NETWORK"
+| project
+    EventTime_t,
+    SourceIP,
+    DestIp_s,
+    DestPort_s,
+    RawMessage_s
 | sort by EventTime_t asc;
 
 
-// =====================================================
-// 5. SUID Root Shell Execution
-// =====================================================
-
-MeridianAudit_CL
-| where EventTime_t between (datetime(2026-02-06 04:35:00) .. datetime(2026-02-06 04:45:00))
-| where isnotempty(EventTime_t)
-| where comm_s == "rootbash"
-   or exe_s contains "rootbash"
-   or Argv_s contains "rootbash"
-| project EventTime_t, comm_s, exe_s, auid_s, euid_s, Argv_s
-| sort by EventTime_t asc;
-
-
-// =====================================================
-// 6. Persistent health_check Backdoor
-// =====================================================
+// ============================================================================
+// 11. COMMAND AND CONTROL - Verify Backdoor Remained Running
+// ============================================================================
+// Purpose:
+// Determine whether network blocking actually neutralized the persistent
+// health_check process.
+//
+// Finding:
+// health_check remained active after C2 attempts were blocked.
+// ============================================================================
 
 MeridianSnapshot_CL
 | where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
 | where isnotempty(EventTime_t)
 | where ProcBeaconName_s == "health_check"
-   or ProcBeaconExeLink_s contains "health_check"
+    or ProcBeaconExeLink_s contains "health_check"
 | project
     EventTime_t,
     ProcBeaconName_s,
@@ -92,64 +328,282 @@ MeridianSnapshot_CL
 | sort by EventTime_t asc;
 
 
-// =====================================================
-// 7. C2 / Network Blocking Activity
-// =====================================================
-
-MeridianDefender_CL
-| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
-| where isnotempty(EventTime_t)
-| where EventCategory_s == "NETWORK"
-| project EventTime_t, SourceIP, DestIp_s, DestPort_s, RawMessage_s
-| sort by EventTime_t asc;
-
-
-// =====================================================
-// 8. Database / Patient Data Activity
-// =====================================================
+// ============================================================================
+// 12. COLLECTION / EXFILTRATION - Patient Data Activity
+// ============================================================================
+// Purpose:
+// Identify database and web-defense telemetry indicating access to and export
+// of the patient dataset.
+//
+// Findings:
+// - Full patient table query
+// - Patient data export from 10.1.134.57
+// ============================================================================
 
 MeridianDefender_CL
 | where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
 | where isnotempty(EventTime_t)
 | where EventCategory_s == "DB"
-   or RawMessage_s has_any ("patient", "export", "database")
-| project EventTime_t, EventCategory_s, RawMessage_s
+    or RawMessage_s has_any ("export", "dump", "database", "patient", "record")
+| project
+    EventTime_t,
+    EventCategory_s,
+    RawMessage_s
 | sort by EventTime_t asc;
 
 
-// =====================================================
-// 9. Automated Defense Sweep Activity
-// =====================================================
+// ============================================================================
+// 13. COLLECTION / PERSISTENCE - Identify Tampered Configuration
+// ============================================================================
+// Purpose:
+// Review the final automated sweep for configuration files that were detected
+// as modified and automatically reverted.
+//
+// Finding:
+// backup.conf was detected as tampered and reverted.
+// ============================================================================
 
 MeridianDefender_CL
-| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where EventTime_t > datetime(2026-02-06 05:04:00)
 | where isnotempty(EventTime_t)
 | where EventCategory_s == "SWEEP"
-| project EventTime_t, RawMessage_s
+| where RawMessage_s has "tampered"
+| project
+    EventTime_t,
+    RawMessage_s
 | sort by EventTime_t asc;
 
 
-// =====================================================
-// 10. Sysmon Removal / Detection Gap
-// =====================================================
+// ============================================================================
+// 14. DEFENSE EVASION - Identify Early Bootstrap / Setup Noise
+// ============================================================================
+// Purpose:
+// Review the detection burst that occurred before the confirmed intrusion.
+//
+// Findings:
+// Multiple detections fired simultaneously for SSH key changes, crontab
+// modifications, and new systemd services.
+//
+// Cross-table correlation showed this activity was generated by the defense
+// stack's own bootstrap/setup process rather than the confirmed attacker.
+// ============================================================================
+
+MeridianDefender_CL
+| where EventTime_t < datetime(2026-02-06 03:00:00)
+| where isnotempty(EventTime_t)
+| where EventCategory_s == "DETECTION"
+| project
+    EventTime_t,
+    RawMessage_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 15. DEFENSE EVASION - Validate Attacker Activity Around Bootstrap Detections
+// ============================================================================
+// Purpose:
+// Check whether the confirmed attacker IP generated web traffic during the
+// early detection burst.
+//
+// Finding:
+// No matching attacker web activity existed around the bootstrap detections.
+// ============================================================================
+
+MeridianAccess_CL
+| where EventTime_t between (
+    datetime(2026-02-06 02:40:00) ..
+    datetime(2026-02-06 03:00:00)
+)
+| where isnotempty(EventTime_t)
+| where ClientIp_s == "10.1.134.57"
+| project
+    EventTime_t,
+    ClientIp_s,
+    HttpMethod_s,
+    RequestUri_s,
+    UserAgent_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 16. DEFENSE EVASION - Review Attacker SSH Timeline Around Bootstrap Events
+// ============================================================================
+// Purpose:
+// Compare confirmed SSH activity from the attacker IP against the early
+// detection timestamps.
+//
+// Finding:
+// Attacker SSH activity occurred earlier, while the 02:53:31 detection burst
+// did not align with an active attacker session.
+// ============================================================================
+
+MeridianAuth_CL
+| where EventTime_t between (
+    datetime(2026-02-06 02:40:00) ..
+    datetime(2026-02-06 03:00:00)
+)
+| where isnotempty(EventTime_t)
+| where SourceIP == "10.1.134.57"
+| project
+    EventTime_t,
+    ProcessName_s,
+    TargetUser_s,
+    SourceIP,
+    RawMessage_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 17. DEFENSIVE COLLATERAL DAMAGE - Identify Removed Services
+// ============================================================================
+// Purpose:
+// Review services explicitly removed by the automated response sweep.
+//
+// Finding:
+// sysmon.service was removed by automated remediation.
+// ============================================================================
 
 MeridianDefender_CL
 | where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
 | where isnotempty(EventTime_t)
-| where RawMessage_s contains "Removed service"
-| project EventTime_t, EventCategory_s, RawMessage_s
+| where RawMessage_s contains "service"
+| where RawMessage_s contains "Removed"
+| project
+    EventTime_t,
+    EventCategory_s,
+    RawMessage_s
 | sort by EventTime_t asc;
 
 
-// =====================================================
-// 11. AVML Memory Acquisition
-// =====================================================
+// ============================================================================
+// 18. DEFENSIVE COLLATERAL DAMAGE - Validate Sysmon Was Legitimate Tooling
+// ============================================================================
+// Purpose:
+// Cross-reference Sysmon activity in Syslog to verify that the removed service
+// was legitimate defensive monitoring software.
+//
+// Findings:
+// - Starting Sysmon event logger
+// - Sysmon v1.5.0 - Monitors system events
+// ============================================================================
+
+MeridianSyslog_CL
+| where EventTime_t between (
+    datetime(2026-02-06 02:50:00) ..
+    datetime(2026-02-06 03:15:00)
+)
+| where isnotempty(EventTime_t)
+| where RawMessage_s contains "sysmon"
+    or RawMessage_s contains "Sysmon"
+    or RawMessage_s contains "libsysinternals"
+| project
+    EventTime_t,
+    ProcessName_s,
+    RawMessage_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// 19. INCIDENT RESPONSE - AVML Memory Acquisition
+// ============================================================================
+// Purpose:
+// Identify forensic volatile-memory acquisition performed by the returning
+// administrator.
+//
+// Findings:
+// AVML was executed twice.
+// Memory image destination:
+// /tmp/evidence/memory.lime
+// ============================================================================
 
 MeridianAudit_CL
-| where EventTime_t between (datetime(2026-02-06 05:00:00) .. datetime(2026-02-06 05:30:00))
+| where EventTime_t between (
+    datetime(2026-02-06 05:00:00) ..
+    datetime(2026-02-06 05:30:00)
+)
 | where isnotempty(EventTime_t)
 | where comm_s contains "avml"
     or exe_s contains "avml"
     or Argv_s contains "avml"
-| project EventTime_t, comm_s, exe_s, auid_s, euid_s, Argv_s
+| project
+    EventTime_t,
+    comm_s,
+    exe_s,
+    auid_s,
+    euid_s,
+    Argv_s
 | sort by EventTime_t asc;
+
+
+// ============================================================================
+// 20. INCIDENT RESPONSE - Confirm the Persistent Backdoor Is Still Live
+// ============================================================================
+// Purpose:
+// Verify whether the health_check process remained active after automated
+// remediation and forensic evidence acquisition.
+//
+// Finding:
+// health_check remained active and required manual termination/removal before
+// the incident could be considered contained.
+// ============================================================================
+
+MeridianSnapshot_CL
+| where EventTime_t between (datetime(2026-02-06) .. datetime(2026-02-07))
+| where isnotempty(EventTime_t)
+| where ProcBeaconName_s == "health_check"
+    or ProcBeaconExeLink_s contains "health_check"
+| project
+    EventTime_t,
+    ProcBeaconName_s,
+    ProcBeaconExeLink_s,
+    ProcBeaconPid_s,
+    ProcBeaconPPid_s,
+    ProcBeaconUid_s
+| sort by EventTime_t asc;
+
+
+// ============================================================================
+// END OF QUERY PACK
+// ============================================================================
+//
+// Key Investigation Findings:
+//
+// Reconnaissance:
+//   Nmap -> curl -> WhatWeb -> Gobuster
+//
+// Initial Access:
+//   config_viewer.php
+//   Path traversal / LFI
+//
+// Files Retrieved:
+//   /etc/passwd
+//   database.conf
+//
+// Valid Account:
+//   svc_backup
+//
+// Privilege Escalation:
+//   /tmp/rootbash -p
+//
+// Persistent Backdoor:
+//   /opt/meridian/scripts/health_check
+//
+// C2 Destination:
+//   10.1.134.57:43212
+//
+// Data Impact:
+//   Patient data export
+//
+// Configuration Tampering:
+//   backup.conf
+//
+// Detection Gap:
+//   sysmon.service removed by automated remediation
+//
+// Forensic Acquisition:
+//   AVML -> /tmp/evidence/memory.lime
+//
+// Final Required IR Action:
+//   Manually terminate and remove health_check
+//
+// ============================================================================
