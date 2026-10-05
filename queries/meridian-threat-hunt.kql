@@ -1,0 +1,4 @@
+// Microsoft Sentinel Threat Hunt - Meridian Health
+// Platform: Microsoft Sentinel / Azure Log Analytics
+// Language: KQL
+// Purpose: Key threat-hunting queries used during the investigation
